@@ -102,11 +102,17 @@ extension LibraryGame {
 /// A folder in the game's mods folder: RomFS files that replace the game's own (DM_ROMFS_OVERLAY, hle_fs.c). The files are
 /// found in <mod>/romfs, in an Atmosphère layout (<mod>/atmosphere/contents/<title ID>/romfs, <mod>/contents/<title ID>/romfs)
 /// or in the folder itself. A mod with only exefs/ changes the game's code, which the rewriter does not take: listed, not usable.
+/// A folder with `nx2apple-mod.json` (ModRecipe, #1133) is built from the player's game: its files are its `romfs/` once built,
+/// never the folder itself (that holds the script and its data).
 struct GameMod: Identifiable, Equatable {
     let name: String
     let romfs: String?
+    var recipe: ModRecipe? = nil
+    var recipeProblem: String? = nil   // a recipe file that cannot be used, in words
     var id: String { name }
     var usable: Bool { romfs != nil }
+    var hasRecipe: Bool { recipe != nil || recipeProblem != nil }
+    var needsBuild: Bool { recipe != nil && romfs == nil }
 
     static func folder(for game: LibraryGame, library: String) -> URL {
         let root = library.isEmpty
@@ -124,6 +130,13 @@ struct GameMod: Identifiable, Equatable {
             var dir: ObjCBool = false
             let mod = folder.appendingPathComponent(name)
             guard fm.fileExists(atPath: mod.path, isDirectory: &dir), dir.boolValue else { return nil }
+            if fm.fileExists(atPath: mod.appendingPathComponent(ModRecipe.fileName).path) {
+                let built = mod.appendingPathComponent("romfs").path
+                let romfs = fm.fileExists(atPath: built) ? built : nil
+                do { return GameMod(name: name, romfs: romfs, recipe: try ModRecipe.read(in: mod, fm: fm)) }
+                catch ModRecipe.Problem.unreadable(let why), ModRecipe.Problem.invalid(let why) { return GameMod(name: name, romfs: romfs, recipeProblem: why) }
+                catch { return GameMod(name: name, romfs: romfs, recipeProblem: error.localizedDescription) }
+            }
             let candidates = ["romfs", "atmosphere/contents/\(titleID)/romfs", "contents/\(titleID)/romfs"].map { mod.appendingPathComponent($0).path }
             if let found = candidates.first(where: { fm.fileExists(atPath: $0) }) { return GameMod(name: name, romfs: found) }
             let top = ((try? fm.contentsOfDirectory(atPath: mod.path)) ?? []).filter { !$0.hasPrefix(".") }
@@ -148,6 +161,15 @@ extension LibraryGame {
             let v = launchValue(s)
             return s.unsetValue == v ? nil : (s.env, v)
         })
+    }
+
+    /// The folders a build of this game may have left its extracted RomFS in (`<title ID>_build`, BuildStore+Run's workDir): beside
+    /// the chosen output folder, the game's folder, or the base package. A recipe mod is built from the newest RomFS.img there
+    /// when the game has no Mac app yet (ModBuild.gameImage).
+    var buildFolders: [String] {
+        let base = inputs["base"]?.first.map { ($0 as NSString).deletingLastPathComponent } ?? ""
+        var seen = Set<String>()
+        return [outputDirectory, sourceFolder, base].filter { !$0.isEmpty && seen.insert($0).inserted }.map { $0 + "/" + titleID.uppercased() + "_build" }
     }
 
     /// DM_ROMFS_OVERLAY for the mods switched on that can be used, in the list's order: where two replace one file, the

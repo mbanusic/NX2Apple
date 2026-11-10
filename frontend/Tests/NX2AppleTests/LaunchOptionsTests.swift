@@ -120,6 +120,42 @@ final class LaunchOptionsTests: IsolatedDefaultsTestCase {
                        "the list's order (higher wins), and a code-only mod left out")
     }
 
+    /// A mod with nx2apple-mod.json (#1133) is built from the player's game: its folder holds the script and its data, never RomFS
+    /// files, so only its built romfs/ is passed, and before the build it cannot be switched on.
+    func testARecipeModIsUsableOnlyOnceBuilt() throws {
+        var game = LibraryGame(titleID: "0400486024DEC000", name: "Ocarina of Time")
+        let folder = GameMod.folder(for: game, library: temporary.path)
+        let fm = FileManager.default
+        func write(_ path: String, _ text: String) throws {
+            let file = folder.appendingPathComponent(path)
+            try fm.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(text.utf8).write(to: file)
+        }
+        try write("Hrvatski/mals_po.py", "")
+        try write("Hrvatski/hr.json", "{}")
+        try write("Hrvatski/nx2apple-mod.json", #"{"needs": ["Mals"], "build": ["mals_po.py", "build", "{game}", "{out}"]}"#)
+        try write("Broken/nx2apple-mod.json", "{")
+        var mods = GameMod.list(in: folder, titleID: game.titleID)
+        XCTAssertEqual(mods.map(\.name), ["Broken", "Hrvatski"])
+        XCTAssertEqual(mods.map(\.usable), [false, false])
+        XCTAssertEqual(mods.map(\.needsBuild), [false, true])
+        XCTAssertNotNil(mods[0].recipeProblem)
+        game.mods = ["Hrvatski"]
+        XCTAssertEqual(game.modEnvironment(mods), [:], "the folder itself is not RomFS")
+        try write("Hrvatski/romfs/Mals/EUen.Product.110.sarc.zs", "hr")
+        mods = GameMod.list(in: folder, titleID: game.titleID)
+        XCTAssertEqual(mods[1].usable, true)
+        XCTAssertEqual(game.modEnvironment(mods)["DM_ROMFS_OVERLAY"], folder.appendingPathComponent("Hrvatski/romfs").path)
+    }
+
+    func testTheBuildFoldersAreBesideTheOutputTheGameFolderAndTheBasePackage() {
+        var game = LibraryGame(titleID: "0400486024dec000", name: "Ocarina of Time")
+        game.inputs = ["base": ["/Games/Zelda OOT/OoT.nup"]]
+        game.sourceFolder = "/Games/Zelda OOT"
+        game.outputDirectory = "/Out"
+        XCTAssertEqual(game.buildFolders, ["/Out/0400486024DEC000_build", "/Games/Zelda OOT/0400486024DEC000_build"])
+    }
+
     func testShortChoicesAreSegmentedAndTheGameLanguageIsAlwaysAMenu() {
         func segmented(_ env: String, _ labels: [String]) -> Bool { LaunchControl.isSegmented(env: env, labels: labels) }
         XCTAssertTrue(segmented("DM_FPS_TARGET", ["30 fps", "60 fps"]))

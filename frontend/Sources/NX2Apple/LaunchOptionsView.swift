@@ -30,6 +30,9 @@ struct LaunchOptionsView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var choicesRevision = 0   // bumped by a change: the values are read from the store again
     @State private var modsRevision = 0   // bumped by Refresh: the folder is read again
+    @State private var confirmingMod: GameMod?   // Build of a recipe mod asks first: it runs the mod's own script (#1133)
+    @State private var buildingMod: String?
+    @State private var modErrors: [String: String] = [:]   // the last failed build of a recipe mod, by name: its reason
     @State private var frameTimesRevision = 0   // bumped by the switch and Refresh: the recordings are read again
     @EnvironmentObject private var focus: PadFocus
     @EnvironmentObject private var saveSettings: SaveSettingsStore   // the global setup and this game's own choices (SaveLocation.swift)
@@ -103,6 +106,14 @@ struct LaunchOptionsView: View {
             }
         }
         .onChange(of: askingTested) { open in focus.scope = open ? "tested" : "launch" }
+        .sheet(item: $confirmingMod) { mod in
+            LauncherConfirmSheet(title: String(format: loc.t("launch.modBuildTitle"), mod.name), subtitle: game?.displayName(loc.lang) ?? "",
+                                 note: loc.t("launch.modBuildNote"),
+                                 cancelTitle: loc.t("saves.cancel"), confirmTitle: loc.t("launch.modBuild"), scope: "modBuild",
+                                 cancel: { confirmingMod = nil }, confirm: { confirmingMod = nil; buildMod(mod) })
+                .environmentObject(focus).environmentObject(loc)
+        }
+        .onChange(of: confirmingMod) { mod in focus.scope = mod == nil ? "launch" : "modBuild" }
         .sheet(isPresented: mappingPresentation) {
             if let game {
                 GameControllerMappingView(game: game, globalControls: globalControls)
@@ -475,11 +486,17 @@ struct LaunchOptionsView: View {
                         HStack(spacing: 16) {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(mod.name).font(.manrope(14, .medium)).lineLimit(1)
-                                if !mod.usable {
-                                    Text(loc.t("launch.modCode")).font(.manrope(12)).foregroundStyle(LauncherPalette.secondaryText)
+                                if let note = modNote(mod) {
+                                    Text(note).font(.manrope(12)).foregroundStyle(LauncherPalette.secondaryText).fixedSize(horizontal: false, vertical: true)
                                 }
                             }
                             Spacer(minLength: 12)
+                            if mod.recipe != nil {
+                                if buildingMod == mod.name { ProgressView().controlSize(.small) }
+                                Button(loc.t(mod.usable ? "launch.modRebuild" : "launch.modBuild")) { confirmingMod = mod }
+                                    .buttonStyle(LauncherSecondaryButtonStyle()).disabled(buildingMod != nil)
+                                    .padTarget("mod.build." + mod.name, scope: "launch") { if buildingMod == nil { confirmingMod = mod } }
+                            }
                             Toggle(mod.name, isOn: Binding(get: { mod.usable && game.mods.contains(mod.name) },
                                                      set: { library.setMod(mod.name, on: $0, for: gameID) }))
                                 .labelsHidden().toggleStyle(LauncherSwitchStyle()).disabled(!mod.usable)
@@ -557,6 +574,40 @@ struct LaunchOptionsView: View {
     private func openFolder(_ folder: URL) {
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         NSWorkspace.shared.open(folder)
+    }
+
+    /// The line under a mod's name: why it cannot be switched on, or how its build went.
+    private func modNote(_ mod: GameMod) -> String? {
+        if buildingMod == mod.name { return loc.t("launch.modBuilding") }
+        if let problem = mod.recipeProblem { return String(format: loc.t("launch.modRecipeDamaged"), problem) }
+        if let error = modErrors[mod.name] { return String(format: loc.t("launch.modBuildFailed"), error) }
+        if mod.needsBuild { return loc.t("launch.modNeedsBuild") }
+        if mod.recipe != nil { return loc.t("launch.modBuilt") }
+        return mod.usable ? nil : loc.t("launch.modCode")
+    }
+
+    /// Builds a recipe mod from this game's RomFS (ModBuild) off the main thread, then lists the folder again.
+    private func buildMod(_ mod: GameMod) {
+        guard let game, let recipe = mod.recipe, let folder = modsFolder, buildingMod == nil else { return }
+        buildingMod = mod.name; modErrors[mod.name] = nil
+        let dir = folder.appendingPathComponent(mod.name)
+        let image = ModBuild.gameImage(appPath: game.appPath, buildFolders: game.buildFolders)
+        let python = m.deps.pythonPath.isEmpty ? "/usr/bin/python3" : m.deps.pythonPath
+        let noGame = loc.t("launch.modNoGameFiles")
+        Task.detached {
+            let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("nx2apple-mod-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: scratch) }
+            let failure: String?
+            do { try ModBuild.run(recipe, mod: dir, image: image, python: python, scratch: scratch); failure = nil }
+            catch ModBuild.Problem.noGameFiles { failure = noGame }
+            catch ModBuild.Problem.extract(let why) { failure = why }
+            catch ModBuild.Problem.script(let status, let last) { failure = last.isEmpty ? "exit code \(status)" : last }
+            catch ModBuild.Problem.noOutput { failure = "the script wrote no files" }
+            catch { failure = error.localizedDescription }
+            await MainActor.run {
+                buildingMod = nil; modErrors[mod.name] = failure; modsRevision += 1
+            }
+        }
     }
 
     private func openModsFolder() {
